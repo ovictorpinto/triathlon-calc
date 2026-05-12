@@ -15,6 +15,42 @@ resource "aws_s3_bucket_public_access_block" "app" {
   restrict_public_buckets = true
 }
 
+# ── ACM Certificate (deve ser em us-east-1 para CloudFront) ─────────────────
+resource "aws_acm_certificate" "app" {
+  domain_name       = var.domain
+  validation_method = "DNS"
+
+  tags = {
+    Project = var.project_name
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# ── Validação DNS do certificado no Route 53 ─────────────────────────────────
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.app.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      type   = dvo.resource_record_type
+      record = dvo.resource_record_value
+    }
+  }
+
+  zone_id = var.hosted_zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
+}
+
+resource "aws_acm_certificate_validation" "app" {
+  certificate_arn         = aws_acm_certificate.app.arn
+  validation_record_fqdns = [for r in aws_route53_record.cert_validation : r.fqdn]
+}
+
 # ── CloudFront Origin Access Control ────────────────────────────────────────
 resource "aws_cloudfront_origin_access_control" "app" {
   name                              = var.project_name
@@ -27,7 +63,8 @@ resource "aws_cloudfront_origin_access_control" "app" {
 resource "aws_cloudfront_distribution" "app" {
   enabled             = true
   default_root_object = "index.html"
-  price_class         = "PriceClass_100" # US, Canada, Europe (cheapest)
+  price_class         = "PriceClass_100"
+  aliases             = [var.domain]
 
   origin {
     domain_name              = aws_s3_bucket.app.bucket_regional_domain_name
@@ -72,7 +109,9 @@ resource "aws_cloudfront_distribution" "app" {
   }
 
   viewer_certificate {
-    cloudfront_default_certificate = true
+    acm_certificate_arn      = aws_acm_certificate_validation.app.certificate_arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
   }
 
   tags = {
@@ -103,4 +142,17 @@ resource "aws_s3_bucket_policy" "app" {
       }
     ]
   })
+}
+
+# ── Route 53 — aponta subdomínio para CloudFront ─────────────────────────────
+resource "aws_route53_record" "app" {
+  zone_id = var.hosted_zone_id
+  name    = var.domain
+  type    = "A"
+
+  alias {
+    name                   = aws_cloudfront_distribution.app.domain_name
+    zone_id                = aws_cloudfront_distribution.app.hosted_zone_id
+    evaluate_target_health = false
+  }
 }
